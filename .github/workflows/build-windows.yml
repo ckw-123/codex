@@ -26,8 +26,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4   # codex 无 submodule,无需 recursive
 
-      # 不传 toolchain 参数 = 自动读 codex-rs/rust-toolchain.toml(1.95.0)
+      # 从上游的 rust-toolchain.toml 读取钉住的版本,替代原 dtolnay 步骤
+      - name: Read pinned toolchain
+        id: tc
+        shell: bash
+        run: |
+          v=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' codex-rs/rust-toolchain.toml | head -1)
+          echo "pin=$v" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.pin }}
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
