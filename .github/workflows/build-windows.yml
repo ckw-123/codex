@@ -7,26 +7,19 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 与官方 Windows x64 构建一致,规避 libsqlite3-sys 的 intrinsic 问题
   LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
-  # ---- 体积优化:覆盖 codex-rs/Cargo.toml 的 [profile.release] ----
-  # 官方是 lto=thin / debug=line-tables-only / strip=false / codegen-units=4
-  # 环境变量优先级高于 Cargo.toml,fork 无需改动上游文件
-  CARGO_PROFILE_RELEASE_STRIP: "true"      # 等价于 strip = "symbols"
-  CARGO_PROFILE_RELEASE_DEBUG: "false"     # 你说的 ndebug:不生成调试信息/PDB
-  CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"     # 体积优先优化
-  CARGO_PROFILE_RELEASE_LTO: "fat"         # 全量 LTO(替代官方的 thin)
-  # 编译太慢时可放开下面这行(牺牲少量优化换编译速度):
-  # CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+  CARGO_PROFILE_RELEASE_LTO: "fat"
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 180      # fat LTO 的最终链接很慢,务必留足
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4   # codex 无 submodule,无需 recursive
+      - uses: actions/checkout@v4
 
-      # 从上游的 rust-toolchain.toml 读取钉住的版本,替代原 dtolnay 步骤
       - name: Read pinned toolchain
         id: tc
         shell: bash
@@ -42,10 +35,23 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
-          # 改动上面的 profile 环境变量后,记得把 v1 递增,否则会吃到旧配置的缓存
-          shared-key: release-slim-v1
+          shared-key: release-slim-v2
 
-      # windows-latest 已预装 MSVC/cmake/NASM,aws-lc-sys 和 bundled sqlite 可直接编
+      # Match the official pipeline (setup-msvc-env.ps1): prefer the Rust
+      # toolchain's bundled rust-lld over MSVC link.exe. rustc infers lld
+      # flavor from the "rust-lld" file name and still injects the MSVC
+      # LIB/INCLUDE/PATH env into the linker process (get_linker in
+      # rustc_codegen_ssa/src/back/linker.rs), so no VsDevCmd step is needed
+      # for this x64 native build.
+      - name: Prefer rust-lld as linker (match official)
+        shell: pwsh
+        run: |
+          $sysroot = (rustc --print sysroot).Trim()
+          $lld = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+          if (-not (Test-Path $lld)) { throw "rust-lld not found at $lld" }
+          Write-Output "Using Windows linker: $lld"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build codex + sandbox helpers (x64)
         shell: bash
         working-directory: codex-rs
@@ -53,9 +59,7 @@ jobs:
           STABLE_GIT_COMMIT: ${{ github.sha }}
         run: |
           cargo build --release --locked \
-            --bin codex \
-            --bin codex-windows-sandbox-setup \
-            --bin codex-command-runner
+            --bin codex --bin codex-windows-sandbox-setup --bin codex-command-runner
 
       - name: Show binary sizes
         shell: pwsh
@@ -68,16 +72,15 @@ jobs:
         shell: pwsh
         run: |
           $bin = "codex-rs/target/release"
-          Compress-Archive -Path `
-            "$bin/codex.exe", `
-            "$bin/codex-windows-sandbox-setup.exe", `
-            "$bin/codex-command-runner.exe" `
-            -DestinationPath "codex-windows-x64.zip"
+          Compress-Archive -Path "$bin/codex.exe","$bin/codex-windows-sandbox-setup.exe","$bin/codex-command-runner.exe" -DestinationPath "codex-windows-x64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: codex-windows-x64
-          path: codex-windows-x64.zip
+          path: |
+            codex-rs/target/release/codex.exe
+            codex-rs/target/release/codex-windows-sandbox-setup.exe
+            codex-rs/target/release/codex-command-runner.exe
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
