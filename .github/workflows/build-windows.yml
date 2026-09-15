@@ -1,0 +1,176 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_code_mode_host:
+        description: "Also build codex-code-mode-host.exe (requires the V8 toolchain; off by default)"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+  CARGO_PROFILE_RELEASE_LTO: "fat"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned toolchain
+        id: tc
+        shell: bash
+        run: |
+          v=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' codex-rs/rust-toolchain.toml | head -1)
+          echo "pin=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.pin }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          shared-key: release-slim-v2
+
+      # Match the official pipeline (setup-msvc-env.ps1): prefer the Rust
+      # toolchain's bundled rust-lld over MSVC link.exe. rustc infers lld
+      # flavor from the "rust-lld" file name and still injects the MSVC
+      # LIB/INCLUDE/PATH env into the linker process (get_linker in
+      # rustc_codegen_ssa/src/back/linker.rs), so no VsDevCmd step is needed
+      # for this x64 native build.
+      - name: Prefer rust-lld as linker (match official)
+        shell: pwsh
+        run: |
+          $sysroot = (rustc --print sysroot).Trim()
+          $lld = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+          if (-not (Test-Path $lld)) { throw "rust-lld not found at $lld" }
+          Write-Output "Using Windows linker: $lld"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Stamp workspace version from tag (release builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # The repo ships the dev sentinel 0.0.0; official releases bump it.
+          sed -i "0,/^version = \"0\.0\.0\"/s//version = \"${ver}\"/" codex-rs/Cargo.toml
+          grep -n -m1 '^version' codex-rs/Cargo.toml
+
+      - name: Build codex + sandbox helpers (x64)
+        shell: bash
+        working-directory: codex-rs
+        env:
+          STABLE_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          cargo build --release --locked \
+            --bin codex --bin codex-windows-sandbox-setup --bin codex-command-runner
+
+      - name: Build code-mode-host (optional)
+        if: ${{ inputs.build_code_mode_host == true }}
+        shell: bash
+        working-directory: codex-rs
+        env:
+          STABLE_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          # May require the repo's V8 provisioning on stock runners:
+          # see scripts/codex_package/cargo.py (resolve_codex_v8_cargo_env).
+          cargo build --release --locked --bin codex-code-mode-host
+
+      - name: Show binary sizes
+        shell: pwsh
+        run: |
+          Get-ChildItem codex-rs/target/release/*.exe |
+            Where-Object Name -in 'codex.exe','codex-windows-sandbox-setup.exe','codex-command-runner.exe' |
+            ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB) }
+
+      - name: Fetch bundled ripgrep (pinned by scripts/codex_package/rg)
+        shell: pwsh
+        run: |
+          $manifest = (Get-Content "scripts/codex_package/rg" -Raw) -replace '^#!.*?\r?\n', ''
+          $entry = ($manifest | ConvertFrom-Json).platforms.'windows-x86_64'
+          $zip = Join-Path $env:RUNNER_TEMP "ripgrep-win64.zip"
+          Invoke-WebRequest -Uri $entry.providers[0].url -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $entry.digest.ToLowerInvariant()) {
+            throw "ripgrep SHA-256 mismatch: got $hash, expected $($entry.digest)"
+          }
+          $extract = Join-Path $env:RUNNER_TEMP "ripgrep-extract"
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $rg = Join-Path $extract $entry.path
+          if (-not (Test-Path $rg)) {
+            $rg = (Get-ChildItem $extract -Recurse -Filter rg.exe | Select-Object -First 1).FullName
+          }
+          Copy-Item $rg (Join-Path $env:RUNNER_TEMP "rg.exe") -Force
+          Write-Output "ripgrep staged from $($entry.providers[0].url)"
+
+      - name: Assemble package layout
+        shell: pwsh
+        run: |
+          $staging = "package"
+          $bin = "codex-rs/target/release"
+          Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$staging/codex-path", "$staging/codex-resources" | Out-Null
+
+          # Entrypoint + helpers at the package root, matching the installed "codex" layout.
+          Copy-Item "$bin/codex.exe" "$staging/codex-x86_64-pc-windows-msvc.exe"
+          Copy-Item "$bin/codex-windows-sandbox-setup.exe" "$staging/"
+          Copy-Item "$bin/codex-command-runner.exe" "$staging/"
+          # The official layout also keeps helper copies under codex-resources/.
+          Copy-Item "$bin/codex-windows-sandbox-setup.exe" "$staging/codex-resources/"
+          Copy-Item "$bin/codex-command-runner.exe" "$staging/codex-resources/"
+          if (Test-Path "$bin/codex-code-mode-host.exe") {
+            Copy-Item "$bin/codex-code-mode-host.exe" "$staging/"
+          }
+
+          # rg.exe staged by the ripgrep step above.
+          Copy-Item (Join-Path $env:RUNNER_TEMP "rg.exe") "$staging/codex-path/rg.exe"
+          if (-not (Test-Path "$staging/codex-path/rg.exe")) { throw "codex-path/rg.exe missing" }
+
+          # Package metadata (mirrors the installed variant).
+          $cargoToml = Get-Content "codex-rs/Cargo.toml" -Raw
+          $m = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\].*?^\s*version\s*=\s*"([^"]+)"')
+          $version = if ($m.Success) { $m.Groups[1].Value } else { "0.0.0" }
+          $meta = [ordered]@{
+            layoutVersion = 1
+            version       = $version
+            target        = "x86_64-pc-windows-msvc"
+            variant       = "codex"
+            entrypoint    = "codex-x86_64-pc-windows-msvc.exe"
+            resourcesDir  = "codex-resources"
+            pathDir       = "codex-path"
+          }
+          $meta | ConvertTo-Json | Set-Content "$staging/codex-package.json" -Encoding utf8
+
+          # NOTE: codex-resources/voice/* is intentionally excluded: the official voice
+          # build needs Bazel + Cygwin inputs + signing (see rust-release-windows.yml),
+          # and OpenAI also ships voice-free packages. To include it locally, copy
+          # codex-resources/voice from an official install into $staging/codex-resources/.
+
+          Compress-Archive -Path "$staging/*" -DestinationPath "codex-windows-x64.zip" -Force
+          $total = Get-ChildItem $staging -Recurse -File | Measure-Object Length -Sum
+          Write-Output ("package staged: {0} files, {1:N1} MB uncompressed" -f $total.Count, ($total.Sum / 1MB))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-windows-x64
+          path: |
+            codex-windows-x64.zip
+            codex-rs/target/release/codex.exe
+            codex-rs/target/release/codex-windows-sandbox-setup.exe
+            codex-rs/target/release/codex-command-runner.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: codex-windows-x64.zip
